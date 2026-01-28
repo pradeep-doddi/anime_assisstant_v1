@@ -2,17 +2,23 @@ import sys
 import os
 import json
 import threading
+import requests
 
-from dotenv import load_dotenv
-load_dotenv()
-
-import google.generativeai as genai
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QLineEdit
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QLineEdit, QTextEdit
+)
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtCore import Qt, pyqtSignal
 
-MEMORY_FILE = "memory.json"
-MAX_CHARS = 400
+# ---------------- CONFIG ----------------
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "mistral"   # must be pulled
+MAX_CHARS = 450
+SHORT_MEMORY_LIMIT = 4
+
+PROFILE_FILE = "profile.json"
+SHORT_MEMORY_FILE = "short_memory.json"
+# ----------------------------------------
 
 
 class Assistant(QWidget):
@@ -40,9 +46,9 @@ class Assistant(QWidget):
 
         self.image = QLabel(self)
         self.image.setPixmap(pixmap)
-        self.image.move(0, 140)
+        self.image.move(0, 210)
 
-        self.resize(pixmap.width(), pixmap.height() + 140)
+        self.resize(pixmap.width(), pixmap.height() + 210)
 
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(
@@ -50,16 +56,16 @@ class Assistant(QWidget):
             screen.height() - self.height() - 15
         )
 
-        # ---------- Output bubble ----------
-        self.output = QLabel(self)
-        self.output.setWordWrap(True)
-        self.output.setGeometry(10, 10, self.width() - 20, 110)
+        # ---------- Output (Scrollable Floating Bubble) ----------
+        self.output = QTextEdit(self)
+        self.output.setReadOnly(True)
+        self.output.setGeometry(10, 10, self.width() - 20, 180)
         self.output.setStyleSheet("""
-            QLabel {
+            QTextEdit {
                 background-color: rgba(0,0,0,210);
                 color: white;
                 padding: 8px;
-                border-radius: 10px;
+                border-radius: 12px;
                 font-size: 11px;
             }
         """)
@@ -68,21 +74,32 @@ class Assistant(QWidget):
         # ---------- Input ----------
         self.input = QLineEdit(self)
         self.input.setPlaceholderText("Ask me anything…")
-        self.input.setGeometry(10, 120, self.width() - 20, 30)
+        self.input.setGeometry(10, 195, self.width() - 20, 30)
         self.input.returnPressed.connect(self.on_enter)
         self.input.hide()
 
-        # ---------- Gemini ----------
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = genai.GenerativeModel("models/gemini-flash-latest")
-
-        # ---------- Memory ----------
-        self.memory = []
-
         self.answer_ready.connect(self.render_answer)
 
+        # ---------- Memory ----------
+        self.profile = self.load_json(PROFILE_FILE, {})
+        self.short_memory = self.load_json(SHORT_MEMORY_FILE, [])
+
+    # ---------- JSON helpers ----------
+    def load_json(self, file, default):
+        if os.path.exists(file):
+            try:
+                with open(file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                return default
+        return default
+
+    def save_json(self, file, data):
+        with open(file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
     # ---------- Click ----------
-    def mousePressEvent(self, e):
+    def mousePressEvent(self, event):
         self.input.clear()
         self.input.show()
         self.input.setFocus()
@@ -93,51 +110,101 @@ class Assistant(QWidget):
         if not text:
             return
 
+        text_lower = text.lower()
+
+        # ---- Remember name ----
+        if "my name is" in text_lower:
+            name = text.split("is")[-1].strip().capitalize()
+            self.profile["name"] = name
+            self.save_json(PROFILE_FILE, self.profile)
+            self.render_answer(f"Got it 👍 I’ll call you {name}.")
+            return
+
+        if "what is my name" in text_lower:
+            name = self.profile.get("name")
+            self.render_answer(
+                f"Your name is {name}." if name else "You haven’t told me your name yet."
+            )
+            return
+
         self.input.hide()
+        self.output.clear()
         self.output.setText("Thinking…")
         self.output.show()
 
         threading.Thread(
-            target=self.ask_gemini,
+            target=self.ask_ollama,
             args=(text,),
             daemon=True
         ).start()
 
-    # ---------- Gemini ----------
-    def ask_gemini(self, user_text):
+    # ---------- Ollama ----------
+    def ask_ollama(self, user_text):
         try:
-            chat = self.model.start_chat()
+            context_lines = []
 
-            # minimal safe memory
-            for m in self.memory[-1:]:
-                chat.send_message(m["user"])
-                chat.send_message(m["assistant"])
+            if "name" in self.profile:
+                context_lines.append(f"The user's name is {self.profile['name']}.")
 
-            response = chat.send_message(user_text)
-            answer = response.text.strip() if response.text else ""
+            for m in self.short_memory:
+                context_lines.append(
+                    f"Previously discussed: {m['user']}."
+                )
+
+            context = "\n".join(context_lines)
+
+            prompt = f"""
+You are a helpful desktop assistant.
+
+Context:
+{context}
+
+Question:
+{user_text}
+
+Answer clearly and concisely.
+""".strip()
+
+            response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False
+                },
+                timeout=120
+            )
+
+            data = response.json()
+            answer = (data.get("response") or "").strip()
 
             if not answer:
-                answer = "I didn’t receive a reply. Please try again."
+                answer = "⚠️ The model did not return a response. Please rephrase."
 
-            answer = answer[:MAX_CHARS]
+            # ---- Safe truncation (no mid-word cut) ----
+            if len(answer) > MAX_CHARS:
+                answer = answer[:MAX_CHARS].rsplit(" ", 1)[0]
+                answer += "\n\n…(response truncated — ask me to continue)"
 
-            self.memory.append({
+            # ---- Short memory ----
+            self.short_memory.append({
                 "user": user_text,
                 "assistant": answer
             })
+            self.short_memory = self.short_memory[-SHORT_MEMORY_LIMIT:]
+            self.save_json(SHORT_MEMORY_FILE, self.short_memory)
 
         except Exception as e:
-            msg = str(e).lower()
-            if "quota" in msg or "limit" in msg:
-                answer = "Usage limit reached. Please wait and try again."
-            else:
-                answer = f"Error: {e}"
+            answer = f"Error: {e}"
 
         self.answer_ready.emit(answer)
 
     # ---------- Render ----------
     def render_answer(self, text):
-        self.output.setText(text)
+        self.output.setPlainText(text)
+        self.output.verticalScrollBar().setValue(
+            self.output.verticalScrollBar().maximum()
+        )
         self.input.clear()
         self.input.show()
         self.input.setFocus()
